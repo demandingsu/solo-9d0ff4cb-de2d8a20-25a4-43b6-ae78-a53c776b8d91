@@ -283,3 +283,189 @@ def test_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert "新建拆样运行" in resp.text
+
+
+# ------------------------------------------------------------ 质控(Q20 占比暂扣/确认放行)
+
+def make_qc_inputs():
+    """S1 的 R1 全部低质量(>10% 低于 Q20)将被暂扣;S2 高质量放行;
+    S3 无读段(空组);一条未分配读段。"""
+    samples_csv = "sample_id,index\nS1,AAAACCCC\nS2,AAAACCGG\nS3,GGGGTTTT\n"
+    reads = (
+        [("AAAACCCC", "#" * 40, "I" * 40)] * 10   # S1:R1 全为 Q2
+        + [("AAAACCGG", "I" * 40, "I" * 40)] * 10  # S2:全部 Q40
+        + [("NNNNNNNN", "I" * 40, "I" * 40)]       # 未分配
+    )
+    r1, r2, i1 = [], [], []
+    for n, (idx, q1, q2) in enumerate(reads):
+        head = f"INST:1:FC:1:1101:{3000 + n}:{4000 + n}"
+        r1.append((f"{head} 1:N:0:0", SEQ1, q1))
+        r2.append((f"{head} 2:N:0:0", SEQ2, q2))
+        i1.append((f"{head} 1:N:0:0", idx, "I" * len(idx)))
+    return fq(r1).encode(), fq(r2).encode(), fq(i1).encode(), samples_csv.encode()
+
+
+def submit_qc(client, run_number="RUNQ"):
+    r1, r2, i1, csv = make_qc_inputs()
+    return submit(client, run_number, r1, r2, i1, csv)
+
+
+def qc_of(status):
+    return {c["sample_id"]: c["qc"] for c in status["counts"]}
+
+
+def test_below_q20_phred33():
+    from app.demux import below_q20
+    assert below_q20("I" * 40) == 0    # Q40
+    assert below_q20("5" * 40) == 0    # 恰为 Q20,不算"低于"
+    assert below_q20("4" * 40) == 40   # Q19
+    assert below_q20("#" * 40) == 40   # Q2
+    assert below_q20("I5I4") == 1      # 仅 '4' 低于 Q20
+
+
+def test_qc_verdict_boundaries():
+    from app.main import qc_verdict
+    assert qc_verdict(0, 0, 0, 0) == "no_data"        # 空组
+    assert qc_verdict(100, 10, 100, 0) == "released"  # 恰好 10% 不算超过
+    assert qc_verdict(100, 11, 100, 0) == "held"      # R1 超 10%
+    assert qc_verdict(100, 0, 100, 11) == "held"      # R2 超 10%
+    assert qc_verdict(100, 5, 100, 5) == "released"
+
+
+def test_qc_hold_and_confirm_release(client):
+    rid = run_id_of(submit_qc(client))
+    st = wait_done(client, rid)
+    assert st["status"] == "published", st["error"]
+    qc = qc_of(st)
+    assert qc["S1"]["status"] == "held" and not qc["S1"]["confirmed"]
+    assert (qc["S1"]["r1_total"], qc["S1"]["r1_below"]) == (400, 400)
+    assert (qc["S1"]["r2_total"], qc["S1"]["r2_below"]) == (400, 0)
+    assert qc["S2"]["status"] == "released"
+    assert qc["S3"]["status"] == "no_data"
+    assert qc["undetermined"]["status"] == "released"
+
+    # 暂扣组双端都不可下载;放行组可下载;空组无数据不可下载;日志不受限
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+    assert client.get(f"/runs/{rid}/download/S1_R2.fastq").status_code == 409
+    assert client.get(f"/runs/{rid}/download/S2_R1.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/S2_R2.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/S3_R1.fastq").status_code == 409
+    assert client.get(f"/runs/{rid}/download/undetermined_R1.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/demux.log").status_code == 200
+
+    # 运行页显示双端占比、状态与确认入口
+    page = client.get(f"/runs/{rid}").text
+    assert "100.00%" in page and "0.00%" in page
+    assert "暂扣" in page and "确认放行" in page and "无数据" in page
+
+    # 日志里的质量结论与同次文件、对数同批产生
+    log = client.get(f"/runs/{rid}/download/demux.log").text
+    assert "S1\tR1=100.00%\tR2=0.00%\t暂扣" in log
+    assert "S3\t无数据" in log
+
+    # 非暂扣组/不存在组不能确认
+    assert client.post(f"/runs/{rid}/groups/S2/release").status_code == 409
+    assert client.post(f"/runs/{rid}/groups/S3/release").status_code == 409
+    assert client.post(f"/runs/{rid}/groups/NOPE/release").status_code == 404
+
+    # 确认放行后双端可下载;重复确认幂等
+    resp = client.post(f"/runs/{rid}/groups/S1/release", follow_redirects=False)
+    assert resp.status_code == 303
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/S1_R2.fastq").status_code == 200
+    again = client.post(f"/runs/{rid}/groups/S1/release", follow_redirects=False)
+    assert again.status_code == 303  # 重复确认幂等
+    st2 = client.get(f"/api/runs/{rid}").json()
+    assert qc_of(st2)["S1"]["confirmed"] is True
+
+
+def test_qc_confirm_survives_restart(client):
+    from app.main import recover_interrupted
+    rid = run_id_of(submit_qc(client, "RUNRS"))
+    assert wait_done(client, rid)["status"] == "published"
+    client.post(f"/runs/{rid}/groups/S1/release")
+    recover_interrupted()  # 模拟重启:已发布组的确认仍有效
+    st = client.get(f"/api/runs/{rid}").json()
+    assert st["status"] == "published"
+    assert qc_of(st)["S1"]["confirmed"] is True
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 200
+
+
+def test_qc_concurrent_confirm_and_download(client):
+    """并发确认与下载:每个请求只看到已提交的组状态,确认全部落库后必放行。"""
+    import concurrent.futures
+    rid = run_id_of(submit_qc(client, "RUNC"))
+    assert wait_done(client, rid)["status"] == "published"
+
+    def confirm():
+        return client.post(f"/runs/{rid}/groups/S1/release",
+                           follow_redirects=False).status_code
+
+    def dl():
+        return client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(confirm) if i % 2 == 0 else ex.submit(dl)
+                for i in range(16)]
+        results = [f.result() for f in futs]
+    confirms = results[0::2]
+    downloads = results[1::2]
+    assert set(confirms) == {303}            # 并发确认幂等,都成功
+    assert set(downloads) <= {200, 409}      # 只按已提交状态供数,无第三种结果
+    # 确认全部提交后,下载必然放行
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 200
+    st = client.get(f"/api/runs/{rid}").json()
+    assert qc_of(st)["S1"]["confirmed"] is True
+
+
+def test_qc_failed_run_retry_no_inheritance(client):
+    """尾部损坏 -> 失败,不留质控结论;同号重试产生全新结论,不继承旧确认。"""
+    r1, r2, i1, csv = make_qc_inputs()
+    bad_r2 = r2[: r2.rfind(b"\n", 0, r2.rfind(b"\n"))]  # 末条记录缺质量行
+    rid = run_id_of(submit(client, "RUNF", r1, bad_r2, i1, csv))
+    st = wait_done(client, rid)
+    assert st["status"] == "failed" and "截断" in st["error"]
+    assert st["counts"] == []  # 失败运行没有任何计数与质控结论
+    assert not (client.data_dir / "published" / "RUNF").exists()
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 409
+    assert client.post(f"/runs/{rid}/groups/S1/release").status_code == 409
+
+    rid2 = run_id_of(submit_qc(client, "RUNF"))  # 同号重试
+    st2 = wait_done(client, rid2)
+    assert st2["status"] == "published"
+    qc = qc_of(st2)
+    assert qc["S1"]["status"] == "held" and not qc["S1"]["confirmed"]
+    assert client.get(f"/runs/{rid2}/download/S1_R1.fastq").status_code == 409
+    client.post(f"/runs/{rid2}/groups/S1/release")
+    assert client.get(f"/runs/{rid2}/download/S1_R1.fastq").status_code == 200
+
+
+def test_legacy_run_without_qc_unevaluated(client):
+    """旧运行没有质控记录:页面标未评估,下载保持原行为,不能确认。"""
+    from app.db import db_conn
+    from app.config import db_path, published_dir
+    pub = published_dir() / "OLD1"
+    pub.mkdir(parents=True)
+    (pub / "S1_R1.fastq").write_text(fq([("h 1:N:0:0", SEQ1, QUAL)]))
+    (pub / "S1_R2.fastq").write_text(fq([("h 2:N:0:0", SEQ2, QUAL)]))
+    (pub / "demux.log").write_text("旧日志")
+    with db_conn(db_path()) as conn:
+        cur = conn.execute(
+            "INSERT INTO runs(run_number, status, staging_dir, created_at, "
+            "updated_at, published_at, total_pairs) "
+            "VALUES ('OLD1', 'published', '', 't', 't', 't', 1)"
+        )
+        rid = cur.lastrowid
+        conn.execute(
+            "INSERT INTO sample_counts(run_id, sample_id, index_seq, pairs, "
+            "corrected) VALUES (?, 'S1', 'AAAACCCC', 1, 0)",
+            (rid,),
+        )
+    page = client.get(f"/runs/{rid}").text
+    assert "未评估" in page
+    assert client.get(f"/runs/{rid}/download/S1_R1.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/S1_R2.fastq").status_code == 200
+    assert client.get(f"/runs/{rid}/download/demux.log").status_code == 200
+    assert client.post(f"/runs/{rid}/groups/S1/release").status_code == 404
+    st = client.get(f"/api/runs/{rid}").json()
+    assert qc_of(st)["S1"] is None

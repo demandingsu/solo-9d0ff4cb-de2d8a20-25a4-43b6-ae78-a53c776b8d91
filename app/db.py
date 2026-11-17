@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS sample_counts (
   corrected  INTEGER NOT NULL DEFAULT 0,   -- 其中经单碱基纠错的对数
   PRIMARY KEY (run_id, sample_id)
 );
+CREATE TABLE IF NOT EXISTS sample_qc (
+  run_id         INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  sample_id      TEXT NOT NULL,
+  r1_total       INTEGER NOT NULL DEFAULT 0,  -- R1 碱基总数
+  r1_below       INTEGER NOT NULL DEFAULT 0,  -- R1 低于 Q20 的碱基数(Phred+33)
+  r2_total       INTEGER NOT NULL DEFAULT 0,
+  r2_below       INTEGER NOT NULL DEFAULT 0,
+  qc_status      TEXT NOT NULL
+                 CHECK (qc_status IN ('released', 'held', 'no_data')),
+  released_by_qc INTEGER NOT NULL DEFAULT 0,  -- 质控员确认放行(仅对暂扣组有意义)
+  confirmed_at   TEXT,
+  PRIMARY KEY (run_id, sample_id)
+);
 """
 
 

@@ -12,6 +12,15 @@ from itertools import zip_longest
 BASES = "ACGT"
 _MISSING = object()  # zip_longest 哨兵:某份文件先读完
 
+# Phred+33:Q = ord(c) - 33,Q20 对应字符 '5'(33+20=53);字符小于 '5' 即 Q<20。
+# 翻译成 0/1 字节的查表,配合 bytes.count 在 C 层完成统计。
+_LOW_Q20_TABLE = bytes(1 if i < 33 + 20 else 0 for i in range(256))
+
+
+def below_q20(qual: str) -> int:
+    """质量串(Phred+33)中 Phred 分数低于 Q20 的碱基数。"""
+    return qual.encode("ascii").translate(_LOW_Q20_TABLE).count(1)
+
 
 class FastqFormatError(Exception):
     """FASTQ 结构损坏或三份文件读对不一致。"""
@@ -80,13 +89,16 @@ def assign_index(index, exact, neighbors):
 def demultiplex(r1_path, r2_path, i1_path, samples, out_dir):
     """逐对拆分。samples 为 [(样本号, 索引序列)],输出写入 out_dir。
 
-    返回 {'total_pairs', 'counts': {组: [对数, 纠错对数]}, 'order': [组...]}。
+    返回 {'total_pairs', 'counts': {组: [对数, 纠错对数]}, 'order': [组...],
+          'qc': {组: [R1碱基数, R1低于Q20数, R2碱基数, R2低于Q20数]}}。
+    计数与质控统计在同一次逐对扫描中产生,与输出文件天然对应。
     输出文件按输入顺序追加,保证各组内读段顺序与原始一致。
     """
     exact, neighbors = build_matcher(samples)
     order = [sid for sid, _ in samples] + ["undetermined"]
     writers = {}
     counts = {sid: [0, 0] for sid in order}
+    qc = {sid: [0, 0, 0, 0] for sid in order}
     try:
         for sid in order:
             writers[sid] = (
@@ -120,8 +132,13 @@ def demultiplex(r1_path, r2_path, i1_path, samples, out_dir):
             counts[key][0] += 1
             if corrected:
                 counts[key][1] += 1
+            q = qc[key]
+            q[0] += len(q1)
+            q[1] += below_q20(q1)
+            q[2] += len(q2)
+            q[3] += below_q20(q2)
     finally:
         for pair in writers.values():
             for fh in pair:
                 fh.close()
-    return {"total_pairs": total, "counts": counts, "order": order}
+    return {"total_pairs": total, "counts": counts, "order": order, "qc": qc}

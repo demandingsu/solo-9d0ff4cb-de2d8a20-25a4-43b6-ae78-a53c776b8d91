@@ -28,7 +28,31 @@ from .samples import load_samples
 
 RUN_NUMBER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STATUS_LABELS = {"processing": "处理中", "published": "已发布", "failed": "失败"}
+QC_LABELS = {
+    "released": "放行",
+    "held": "暂扣",
+    "no_data": "无数据",
+    "unevaluated": "未评估",  # 旧运行没有质控记录
+}
+QC_HOLD_PCT = 10  # 任一端低于 Q20 的碱基占比超过该百分比即暂扣
 UNDETERMINED = "undetermined"
+
+
+def qc_verdict(r1_total: int, r1_below: int, r2_total: int, r2_below: int) -> str:
+    """空组无数据;任一端低于 Q20 占比 >10% 暂扣;其余放行。
+
+    用整数比较 below*100 > total*QC_HOLD_PCT,避免浮点边界误差。
+    """
+    if r1_total == 0 and r2_total == 0:
+        return "no_data"
+    if (r1_below * 100 > r1_total * QC_HOLD_PCT
+            or r2_below * 100 > r2_total * QC_HOLD_PCT):
+        return "held"
+    return "released"
+
+
+def pct_text(below: int, total: int) -> str:
+    return f"{below / total * 100:.2f}%" if total else "—"
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -118,6 +142,20 @@ def write_log(path: Path, run, sample_list, stats) -> None:
     for sid in stats["order"]:
         pairs, corrected = stats["counts"][sid]
         lines.append(f"  {sid}\t{pairs}\t{corrected}")
+    lines.append(
+        f"质控(Phred+33,低于 Q20 碱基占比,任一端 >{QC_HOLD_PCT}% 暂扣;"
+        "暂扣组需质控确认放行后供下载):"
+    )
+    for sid in stats["order"]:
+        r1t, r1b, r2t, r2b = stats["qc"][sid]
+        verdict = qc_verdict(r1t, r1b, r2t, r2b)
+        if verdict == "no_data":
+            lines.append(f"  {sid}\t无数据")
+        else:
+            lines.append(
+                f"  {sid}\tR1={pct_text(r1b, r1t)}\tR2={pct_text(r2b, r2t)}"
+                f"\t{QC_LABELS[verdict]}"
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -157,6 +195,13 @@ def process_run(run_id: int) -> None:
                     "INSERT INTO sample_counts(run_id, sample_id, index_seq, pairs, "
                     "corrected) VALUES (?,?,?,?,?)",
                     (run_id, sid, index_of.get(sid, ""), pairs, corrected),
+                )
+                r1t, r1b, r2t, r2b = stats["qc"][sid]
+                conn.execute(
+                    "INSERT INTO sample_qc(run_id, sample_id, r1_total, r1_below, "
+                    "r2_total, r2_below, qc_status) VALUES (?,?,?,?,?,?,?)",
+                    (run_id, sid, r1t, r1b, r2t, r2b,
+                     qc_verdict(r1t, r1b, r2t, r2b)),
                 )
         _remove(staging)
     except Exception as exc:  # 任何失败:标失败 + 清半成品,不发布
@@ -278,29 +323,87 @@ def get_counts(run_id: int):
         ).fetchall()
 
 
+def get_qc_map(run_id: int):
+    """{样本号: 质控记录};旧运行没有记录,各组按未评估处理。"""
+    with db_conn(db_path()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM sample_qc WHERE run_id=?", (run_id,)
+        ).fetchall()
+    return {r["sample_id"]: r for r in rows}
+
+
+def group_view(count, qc) -> dict:
+    """运行页一组的展示模型:计数、双端占比、质控状态与可否下载。"""
+    g = {
+        "sample_id": count["sample_id"],
+        "index_seq": count["index_seq"],
+        "pairs": count["pairs"],
+        "corrected": count["corrected"],
+        "r1": f"{count['sample_id']}_R1.fastq",
+        "r2": f"{count['sample_id']}_R2.fastq",
+    }
+    if qc is None:  # 旧运行:无质量数据,保持原下载行为
+        g.update(qc_status="unevaluated", qc_label=QC_LABELS["unevaluated"],
+                 r1_pct="—", r2_pct="—", confirmed=False, downloadable=True)
+        return g
+    status = qc["qc_status"]
+    confirmed = bool(qc["released_by_qc"])
+    g.update(
+        qc_status=status,
+        qc_label=QC_LABELS[status],
+        r1_pct=pct_text(qc["r1_below"], qc["r1_total"]),
+        r2_pct=pct_text(qc["r2_below"], qc["r2_total"]),
+        confirmed=confirmed,
+        downloadable=(status == "released"
+                      or (status == "held" and confirmed)),
+    )
+    return g
+
+
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
 def run_detail(request: Request, run_id: int):
     run = get_run_or_404(run_id)
+    qc_map = get_qc_map(run_id) if run["status"] == "published" else {}
     groups = [
-        {
-            "sample_id": c["sample_id"],
-            "index_seq": c["index_seq"],
-            "pairs": c["pairs"],
-            "corrected": c["corrected"],
-            "r1": f"{c['sample_id']}_R1.fastq",
-            "r2": f"{c['sample_id']}_R2.fastq",
-        }
-        for c in get_counts(run_id)
+        group_view(c, qc_map.get(c["sample_id"])) for c in get_counts(run_id)
     ]
     return templates.TemplateResponse(
-        request, "run.html", {"run": run, "groups": groups, "labels": STATUS_LABELS}
+        request, "run.html",
+        {"run": run, "groups": groups, "labels": STATUS_LABELS,
+         "qc_hold_pct": QC_HOLD_PCT},
     )
+
+
+@app.post("/runs/{run_id}/groups/{sample_id}/release")
+def confirm_release(run_id: int, sample_id: str):
+    """质控员确认放行暂扣组;幂等,确认后重启仍有效(落库即持久)。"""
+    run = get_run_or_404(run_id)
+    if run["status"] != "published":
+        raise HTTPException(409, "运行未发布,不能确认放行")
+    with db_conn(db_path()) as conn:
+        row = conn.execute(
+            "SELECT qc_status, released_by_qc FROM sample_qc "
+            "WHERE run_id=? AND sample_id=?",
+            (run_id, sample_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "该组没有质控记录,无需确认")
+        if row["qc_status"] != "held":
+            raise HTTPException(409, "该组不在暂扣状态,无需确认")
+        conn.execute(
+            "UPDATE sample_qc SET released_by_qc=1, "
+            "confirmed_at=COALESCE(confirmed_at, ?) "
+            "WHERE run_id=? AND sample_id=? AND qc_status='held'",
+            (utcnow(), run_id, sample_id),
+        )
+    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
 @app.get("/api/runs/{run_id}")
 def run_status(run_id: int):
     run = get_run_or_404(run_id)
     counts = get_counts(run_id)
+    qc_map = get_qc_map(run_id)
     return {
         "run_number": run["run_number"],
         "status": run["status"],
@@ -308,9 +411,21 @@ def run_status(run_id: int):
         "total_pairs": run["total_pairs"],
         "counts": [
             {"sample_id": c["sample_id"], "index_seq": c["index_seq"],
-             "pairs": c["pairs"], "corrected": c["corrected"]}
+             "pairs": c["pairs"], "corrected": c["corrected"],
+             "qc": qc_json(qc_map.get(c["sample_id"]))}
             for c in counts
         ],
+    }
+
+
+def qc_json(qc):
+    if qc is None:
+        return None  # 旧运行:未评估
+    return {
+        "r1_total": qc["r1_total"], "r1_below": qc["r1_below"],
+        "r2_total": qc["r2_total"], "r2_below": qc["r2_below"],
+        "status": qc["qc_status"],
+        "confirmed": bool(qc["released_by_qc"]),
     }
 
 
@@ -319,12 +434,21 @@ def download(run_id: int, filename: str):
     run = get_run_or_404(run_id)
     if run["status"] != "published":
         raise HTTPException(409, "运行未发布,没有完整文件可下载")
-    valid = {"demux.log"}
+    file_to_sid = {}
     for c in get_counts(run_id):
-        valid.add(f"{c['sample_id']}_R1.fastq")
-        valid.add(f"{c['sample_id']}_R2.fastq")
-    if filename not in valid:
+        file_to_sid[f"{c['sample_id']}_R1.fastq"] = c["sample_id"]
+        file_to_sid[f"{c['sample_id']}_R2.fastq"] = c["sample_id"]
+    if filename != "demux.log" and filename not in file_to_sid:
         raise HTTPException(404, "文件不存在")
+    sid = file_to_sid.get(filename)
+    if sid is not None:  # 按已提交的组质控状态供数;无记录的旧运行保持原行为
+        qc = get_qc_map(run_id).get(sid)
+        if qc is not None:
+            if qc["qc_status"] == "no_data":
+                raise HTTPException(409, "该组无数据,没有可下载文件")
+            if qc["qc_status"] == "held" and not qc["released_by_qc"]:
+                raise HTTPException(
+                    409, "该组低质量暂扣中,需质控确认放行后才能下载")
     path = published_dir() / run["run_number"] / filename
     if not path.is_file():
         raise HTTPException(404, "文件不存在")

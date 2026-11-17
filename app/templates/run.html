@@ -16,17 +16,34 @@
 {% endif %}
 
 {% if run.status == "published" %}
-<p>总读段对:{{ run.total_pairs }}</p>
+<p>总读段对:{{ run.total_pairs }}<br>
+质控规则:按 Phred+33 统计每组 R1/R2 低于 Q20 的碱基占比,任一端超过
+{{ qc_hold_pct }}% 即暂扣该组双端下载;空组无数据;暂扣组经质控确认放行后供下载。</p>
 <table>
-  <tr><th>分组</th><th>索引序列</th><th>对数</th><th>其中纠错</th><th>R1 下载</th><th>R2 下载</th></tr>
+  <tr><th>分组</th><th>索引序列</th><th>对数</th><th>其中纠错</th>
+      <th>R1 低于Q20</th><th>R2 低于Q20</th><th>质控状态</th>
+      <th>R1 下载</th><th>R2 下载</th></tr>
   {% for g in groups %}
   <tr>
     <td>{{ g.sample_id }}</td>
     <td>{{ g.index_seq or "—" }}</td>
     <td>{{ g.pairs }}</td>
     <td>{{ g.corrected }}</td>
-    <td><a href="/runs/{{ run.id }}/download/{{ g.r1 }}">{{ g.r1 }}</a></td>
-    <td><a href="/runs/{{ run.id }}/download/{{ g.r2 }}">{{ g.r2 }}</a></td>
+    <td>{{ g.r1_pct }}</td>
+    <td>{{ g.r2_pct }}</td>
+    <td>
+      <span class="badge q-{{ g.qc_status }}">{{ g.qc_label }}</span>
+      {% if g.qc_status == "held" and not g.confirmed %}
+      <form method="post" action="/runs/{{ run.id }}/groups/{{ g.sample_id }}/release"
+            style="display:inline">
+        <button type="submit">确认放行</button>
+      </form>
+      {% elif g.qc_status == "held" and g.confirmed %}
+      <br><small>已确认放行</small>
+      {% endif %}
+    </td>
+    <td>{% if g.downloadable %}<a href="/runs/{{ run.id }}/download/{{ g.r1 }}">{{ g.r1 }}</a>{% else %}—{% endif %}</td>
+    <td>{% if g.downloadable %}<a href="/runs/{{ run.id }}/download/{{ g.r2 }}">{{ g.r2 }}</a>{% else %}—{% endif %}</td>
   </tr>
   {% endfor %}
 </table>
